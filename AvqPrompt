@@ -1,0 +1,189 @@
+1. Product in one paragraph
+
+A junior developer (or a Jira webhook) submits a ticket. The system: scores story completeness against history and asks the BA specific questions if it's underspecified → decomposes it into work packages typed by Avaloq source type → retrieves precedent tickets on two axes (intent similarity × implementation overlap) and pulls their commit diffs as templates → produces an evidence-cited change plan where every change AND every omission cites a precedent, a dependency edge, or a knowledge-card rule → generates the code delta on top of the precedent diff → compiles in a sandbox and runs generated utPLSQL tests, self-correcting up to 3 iterations → opens a PR for Gate 1 (human code review) → on approval, merges and deploys to a test environment → runs UAT auto-review mapping each acceptance criterion to a test with evidence and a reasoned verdict → Gate 2 (human sign-off) → closes the Jira ticket and indexes it as a new precedent (learning loop). Low confidence, retry exhaustion, or missing knowledge escalate to a tech lead with a full trace. A floating "Avaloq Mentor" chat is available on every screen.
+
+2. Tech stack (fixed — do not substitute)
+
+
+Frontend: React 18 + Vite + TypeScript + Tailwind CSS + framer-motion. Single SPA. lucide-react icons. No component library.
+Backend: Python 3.11 + FastAPI + SQLAlchemy + SQLite (file copilot.db). Async workers via asyncio tasks. Live updates via SSE (/api/events/stream).
+Workflow engine: build a small DB-backed durable state machine (tables in §6): every transition is an appended event; on process restart, in-flight tickets resume from their persisted state. Add a comment in code noting Temporal/equivalent as the production replacement.
+LLM adapter: Anthropic Messages API (claude-sonnet-4-5 default, model name in env). Mock adapter returns deterministic, seed-driven responses so the app works without a key.
+Monorepo: frontend/, backend/, root README.md with one-command startup (make dev or docker compose up), DECISIONS.md.
+
+
+3. Repo layout
+
+avaloq-copilot/
+  frontend/src/
+    app/            # router, providers, SSE client
+    design/         # tokens.css, primitives: Button, Card, Pill, Chip, GlassPanel, SimilarityBar, ConfidenceDial, StepCard, CodeBlock, DiffView, ChatBubble
+    pages/          # one folder per frame (§9)
+    lib/            # api client, types (mirror backend schemas)
+  backend/app/
+    main.py         # FastAPI app, SSE, static serving of built frontend
+    models.py       # SQLAlchemy models (§6)
+    state_machine.py# states, transitions, event append, resume-on-boot
+    pipeline/       # intake.py, decompose.py, retrieve.py, plan.py, code.py, test.py, uat.py — one worker per stage
+    reasoning/      # evidence.py (three evidence types, mirror rule), confidence.py (bands, inputs)
+    knowledge/      # catalog.py, cards.py, frontier.py (ask→distill→store)
+    adapters/       # base.py (interfaces) + jira_mock.py, jira_real.py, bitbucket_mock/real, sandbox_mock/real, llm_mock/real
+    seed/           # seed.py + fixtures.json (all of §10)
+    evidence_store.py  # append-only log, hash-chained ids
+  tests/            # backend: pipeline + state machine + evidence rules; frontend: smoke via vitest
+
+4. The workflow (state machine) — implement exactly
+
+States: AI_READY → ANALYZING → (NEEDS_INFO ⇄ ANALYZING) → PLANNING → (AWAITING_DOCS ⇄ PLANNING) → AGENT_CODING → GATE1_REVIEW → DEPLOY_TEST → UAT_REVIEW → GATE2_SIGNOFF → DONE, plus ESCALATED (reachable from PLANNING and AGENT_CODING).
+
+Transition rules:
+
+
+ANALYZING: completeness score < 0.7 → NEEDS_INFO with specific generated questions posted as (mock) Jira comments; BA answer re-scores.
+PLANNING: any work package implicating a source type with no knowledge card → AWAITING_DOCS; user pastes doc text → backend distills it into a new card (LLM adapter) → resume. A plan may only leave PLANNING when every CHANGE and every OMIT row has a citation (§7.3). No evidence path → ESCALATED.
+AGENT_CODING: loop generate → compile (sandbox adapter) → run utPLSQL (sandbox adapter) → on failure feed exact error back, retry, max 3 iterations → success opens (mock) PR → GATE1_REVIEW. Exhaustion → ESCALATED with full failure trace.
+GATE1_REVIEW: UI Approve → merge + DEPLOY_TEST; Request changes (with comment) → back to AGENT_CODING with the comment in worker context.
+UAT_REVIEW: build per-criterion verdicts (§7.5) → GATE2_SIGNOFF. Sign-off → DONE: close mock Jira ticket, index the ticket as a new precedent (it must appear in future retrievals), update co-change stats.
+Every state change: append event row + publish SSE + mirror to mock Jira (status + comment).
+Confidence is computed per work package (§7.4); the ticket state advances with the slowest package; amber/low packages are flagged, not blocking, except < 0.60 before coding → that package escalates.
+
+
+5. Design system — strict (Apple.com aesthetic)
+
+Tokens (put in tokens.css as CSS variables):
+
+
+Background #FBFBFD; ink #1D1D1F; secondary text #6E6E73; accent blue #0071E3; hairline rgba(0,0,0,0.08).
+One gradient only: linear-gradient(90deg,#0071E3,#7B5BFF) — reserved for the hero headline text and similarity/confidence bars. Nowhere else.
+Status: green #1E8E3E (Done/pass), amber #C77700 (warning/gates), red #C0392B (escalation/fail).
+Radii 28 / 18 / 12 px. Shadows: soft layered (0 1px 2px rgba(0,0,0,.04), 0 8px 24px rgba(0,0,0,.06)).
+Type: SF Pro Display fallback Inter (load Inter from Google Fonts). Hierarchy: hero 76/1.05 semibold with gradient; page titles 40; section 28; body 17/1.5; captions 13. Monospace: SF Mono fallback JetBrains Mono for ticket IDs, code, commit hashes.
+Frosted glass: background: rgba(255,255,255,0.72); backdrop-filter: blur(20px) saturate(1.8) — sticky nav, mentor chat, gate action bars.
+Buttons pill-shaped (radius 980px): primary filled blue, secondary hairline. Status pills small caps. Ticket IDs always in monospace chips (AVQ-2314 style, light gray bg).
+Motion (framer-motion): similarity bars animate width on mount (600ms ease-out); step cards animate active→done; page transitions subtle fade/slide 200ms. No bouncy easing.
+Generous whitespace: max content width 1120px centered; section padding ≥ 96px on landing, ≥ 48px in app.
+
+
+6. Data model (SQLAlchemy; mirror as TS types)
+
+
+tickets (id AVQ-…, epic_id, title, story, acceptance_criteria JSON, status/state, completeness_score, created_at)
+work_packages (id, ticket_id, type ENUM[parametrization, script, plsql, interface, workflow, report, test], title, confidence, state, flags JSON)
+precedent_matches (wp_id, matched_ticket_id, intent_sim, impl_overlap, diff_ref)
+plan_items (wp_id, kind ENUM[CHANGE, OMIT, ASK], target_source, description, evidence_type ENUM[precedent, dependency, card], evidence_ref, needs_confirmation BOOL)
+iterations (wp_id, n, action ENUM[compile, test], status, error_text, started_at, finished_at)
+test_results (wp_id, suite, name, status, evidence_ref)
+uat_criteria (ticket_id, n, text, test_design, verdict ENUM[PASS, FAIL, MANUAL], reasoning, evidence_refs JSON)
+events (id, ticket_id, ts, actor ENUM[agent, human, system], type, payload JSON)  ← the durable log; state is derived/cached
+knowledge_cards (source_type, version, body_md, validated_by, token_estimate, created_at)
+source_catalog (source_type, one_liner, has_card BOOL)
+evidence_store (id, ticket_id, kind, payload JSON, sha256_prev, sha256_self)  ← append-only, hash-chained
+escalations (ticket_id, wp_id, reason, trace JSON, status)
+mentor_messages (session_id, role, text, ts)
+
+
+7. Backend behavior specs
+
+7.1 API (all under /api)
+
+POST /tickets/analyze (paste text or pick fixture id) · GET /tickets · GET /tickets/{id} (full drill-down: packages, matches, plan, iterations, tests, uat, events) · POST /tickets/{id}/answer (BA answer) · POST /tickets/{id}/docs (paste doc → card) · POST /tickets/{id}/gate1 {decision, comment} · POST /tickets/{id}/gate2 {decision} · POST /tickets/{id}/escalation/ack · GET /fleet · GET /actions (action queue) · GET /knowledge · POST /mentor (chat) · GET /events/stream (SSE) · GET /stats (landing metrics).
+
+7.2 Retrieval (two axes)
+
+Intent similarity: embed story text (LLM adapter provides embed(); mock returns precomputed vectors from fixtures) → cosine vs. past tickets. Implementation overlap: Jaccard over touched (source, field) sets from the ticket-code graph in fixtures. Return top-3 with both scores + the precedent's diff. Axis disagreement (high intent, low overlap) must lower confidence and produce a plan note.
+
+7.3 Evidence rules (the Source-Necessity Reasoner) — enforce in code, not prompt
+
+A plan_item is invalid unless evidence_type + evidence_ref resolve to: a precedent match ≥ 0.70 intent, a dependency edge present in the fixture graph, or an existing knowledge card rule. OMIT rows require evidence too (e.g., epic scope note) and set needs_confirmation=true. An unresolvable needed source → create ASK row → AWAITING_DOCS. Unit-test these rules directly.
+
+7.4 Confidence
+
+confidence = 0.35*intent_sim + 0.20*impl_agreement + 0.20*pattern_support + 0.15*card_coverage + 0.10*execution_health, recomputed after each iteration. Bands: ≥ 0.85 green (auto-proceed), 0.60–0.84 amber (proceed, flagged at Gate 1 with listed reasons), < 0.60 red (escalate before coding). Store the component breakdown for UI display.
+
+7.5 UAT auto-review
+
+For each acceptance criterion: design a test (LLM adapter; mock uses fixture mapping), "execute" via sandbox adapter (mock returns seeded evidence), verdict PASS/FAIL with reasoning, or MANUAL if not automatable — never drop a criterion. Persist evidence refs into the evidence store.
+
+7.6 Mentor chat
+
+POST /mentor calls LLM adapter with a system prompt: senior Avaloq mentor, answers grounded in the source catalog + knowledge cards, cites card names, says "I don't have a card for that — paste the doc and I'll learn it" when unknown. Mock adapter has 6+ canned Q&A from fixtures.
+
+8. Adapter interfaces (adapters/base.py)
+
+
+JiraAdapter: get_ticket, post_comment, transition, on_webhook (mock: fixtures + in-memory; real: jira lib stub).
+BitbucketAdapter: create_branch, open_pr, merge (mock: records PRs, generates plausible diff refs).
+SandboxAdapter: compile(delta) -> CompileResult, run_tests(suite) -> TestResults, deploy_test_env, run_uat_probe. Mock behavior: driven by fixture script — for the golden ticket, iteration 1 compile fails with a realistic Avaloq/PLSQL error, iteration 2 passes, tests pass; for the escalation ticket, all 3 iterations fail.
+LLMAdapter: complete(system, messages), embed(text). Real: Anthropic SDK. Mock: deterministic fixture-driven outputs (plans, deltas, explanations, UAT designs, mentor answers).
+
+
+9. Frontend — 11 frames (React routes)
+
+All frames share: sticky frosted nav (logo "Avaloq Copilot", links Analyze · Fleet · Knowledge, connection status pills Jira · Bitbucket · ACP green when mock adapters report healthy) and the floating Mentor chat button (bottom-right, opens frame 5's panel).
+
+
+/ Landing — hero: 76px gradient headline "Ship Avaloq work without waiting.", subline, pill CTA "Analyze a ticket", stats row from /stats (tickets indexed, linked commits, zero-touch rate) in three frosted cards. Below: three-step explainer (Find precedent → Do the 80% → Prove the 20%).
+/analyze Ticket Input — large rounded textarea (paste Jira ID or story), sample chips (AVQ-2314, AVQ-2318, AVQ-2291 from fixtures) that fill it, primary CTA. On submit → frame 3.
+/tickets/:id/pipeline Pipeline Running — four step cards (Decompose → Find similar → Trace code → Explain) with pending/active(pulsing)/done states driven by SSE; work packages appear beneath with type tag chips and animated entrance. Completeness gate surfaces here: if NEEDS_INFO, show the agent's questions and an answer box.
+/tickets/:id/results Results / Precedents — per work package: matched ticket cards with monospace ID chip, title, green "Done" pill, animated gradient similarity bar with %, expandable body: commit list (hash, message, author), dark code block (#1D1D1F bg) with the precedent source, and an "AI explanation" panel in plain language. Amber banner "Escalate to tech lead" appears for any red package with one-click escalate.
+Mentor Chat (overlay, all routes) — floating glassmorphic panel 380px, message bubbles (user right/blue, mentor left/white), typing indicator, card citations rendered as small chips.
+/tickets/:id/plan Change Plan — plan rows grouped by work package: kind badge (CHANGE blue / OMIT gray / ASK amber), target source in monospace, description, citation chip (AVQ-1876 · 91% / dep: pay_order_val.max_amt → SEPA_CHNL / card: ami_message v3), confirmation checkboxes for flagged OMITs, per-package ConfidenceDial with component breakdown on hover. AWAITING_DOCS renders a paste-doc modal that creates a card live.
+/tickets/:id/execution Execution View — per package: iteration timeline (attempt chips 1·2·3), streaming sandbox log in a dark console card (SSE), compile/test status pills, retry countdown, on exhaustion a red escalation card with the trace.
+/tickets/:id/gate1 Gate 1 Review — split view: generated diff vs. precedent diff (side-by-side DiffView, monospace, add/remove tinting), right rail: plan citations, test results, confidence breakdown, amber flags. Frosted action bar: green pill "Approve & merge", secondary "Request changes" with comment box. Records reviewer name.
+/tickets/:id/uat UAT Evidence / Gate 2 — acceptance criteria as rows: criterion text → test design → evidence links → verdict pill (PASS green / FAIL red / MANUAL gray) with reasoning expandable. Single "Sign off" pill in frosted bar → confetti-free, restrained success state → ticket Done.
+/fleet Fleet Board + Action Queue — kanban columns mirroring the state machine, ticket cards show live agent action ("compiling · attempt 2/3"), per-package confidence dots, blocker labels. Right rail 320px: Action queue — only human decisions (answer question, provide doc, Gate 1, Gate 2, escalations), each with a deep-link button. This page is the SSE showcase.
+/knowledge Knowledge Admin — source-type catalog table: type, one-liner, card badge (version + validated-by) or amber "no card — provide documentation" button, index freshness per ACP release, top escalation causes list, automation-rate trend (simple sparkline, no chart library needed).
+
+
+10. Seed data pack (put verbatim in fixtures.json; expand consistently where needed)
+
+
+Golden ticket AVQ-2314 "Extend payment order validation for SEPA instant", epic EPC-118 "Instant payments rollout". Story: extend validation so SEPA-instant payment orders above the configured limit are rejected with a dedicated error; limit initially 100,000 EUR; applies to AMI channel; reachability of beneficiary BIC must be checked. Acceptance criteria: (1) orders ≤ limit pass; (2) orders above limit rejected with AVQ_ERR_2231; (3) non-SEPA-instant unaffected; (4) relationship manager notified (UI-only → MANUAL).
+Work packages: parametrization (SEPA_CHNL add row) 0.91 · script (pay_order_val#chk_sepa_inst) 0.87 · interface (AMI error catalog) 0.78 amber · test (ut_pay_order_val) 0.90.
+Precedents: AVQ-1876 "SEPA instant amount limit validation" (intent 0.91, overlap 0.84, commits b3f19c2, a71e044, PR #482, author R. Keller, Done 2025-11-03) · AVQ-1544 "Channel-specific payment validation" (0.87/0.71) · AVQ-1102 "Cut-off validation for urgent payments" (0.74/0.42 — axis-disagreement example).
+Precedent source (dark block + diff base):
+
+
+  PROCEDURE chk_sepa_inst(i_ord IN t_pay_ord) IS
+  BEGIN
+    IF i_ord.chnl = k_chnl_sepa_inst
+       AND i_ord.amt > cfg.max_amt(k_chnl_sepa_inst) THEN
+      err.raise(k_err_amt_limit, i_ord.ord_id);   -- AVQ_ERR_2231
+    END IF;
+  END chk_sepa_inst;
+
+Generated delta adds a BIC-reachability guard calling bic_dir.is_reachable(i_ord.ben_bic); iteration-1 compile error: PLS-00302: component 'IS_REACHABLE' must be declared (fixed in iteration 2 via correct package bic_dir_v2).
+
+
+Knowledge cards: ami_message v3 (validated R. Keller) with the rule "new validation error ⇒ catalog entry + msg_def mapping; append-only field order" · parametrization v2 · avaloq_script v4. Missing card: dxd_feed — used by the AWAITING_DOCS demo; distilling the pasted doc creates dxd_feed v1.
+Escalation ticket AVQ-2318 "Add BIC reachability feed reconciliation" — interface package 0.44, no precedent touches reconciliation, dxd_feed cardless → red path, 3 failed iterations, escalation with trace.
+Incomplete ticket AVQ-2291 "Adjust payment validation" — vague; completeness 0.41; agent questions: "Which channels? Which limit? Which error code should be raised? Precedent AVQ-1876 specified all three."
+Stats: 4,812 tickets indexed · 18,940 linked commits · zero-touch rate 27% (trend up).
+Dependency edges: pay_order_val.max_amt → SEPA_CHNL.max_amt, pay_order_val errors → ami_msg_catalog. Co-change: "14 of 15 SEPA validation tickets touched pay_order_val + SEPA_CHNL + ut_pay_order_val."
+Mentor canned Q&A: what is a DXD feed · difference between parametrization and script change · how utPLSQL is used here · what AVQ_ERR ranges mean · when to escalate · what a knowledge card is.
+
+
+11. Demo script — must work end to end (mock mode, no keys)
+
+
+make dev → landing loads with real stats. 2. Analyze AVQ-2291 → agent asks the three BA questions → answer inline → completeness passes. 3. Analyze AVQ-2314 → pipeline animates → 4 packages appear. 4. Results: AVQ-1876 at 91% with animated bar, commits, dark code, explanation. 5. Plan: citations on every row; confirm the flagged OMIT (pay_rep_04, epic excludes reporting); interface package amber with reasons. 6. Execution: iteration 1 compile fails with the PLS-00302 error visible in the console, iteration 2 green, tests green. 7. Gate 1: side-by-side diffs, approve as "T. Lead" → deploy. 8. UAT: criteria 1–3 PASS with evidence, criterion 4 MANUAL, sign off → DONE; Jira mirror shows closed; /knowledge automation-rate ticks; re-running analyze on a similar story now surfaces AVQ-2314 as a precedent. 9. Analyze AVQ-2318 → AWAITING_DOCS for dxd_feed → paste doc text → card v1 created live → later iterations fail 3× → escalation card with trace appears in fleet + action queue. 10. Mentor chat answers "what is a dxd feed?" citing the new card. 11. Kill the backend mid-AGENT_CODING, restart → ticket resumes from persisted state (durability proof).
+
+
+12. Build order
+
+
+Backend skeleton: models, state machine + event log + resume-on-boot, SSE, seed loader. 2. Mock adapters + pipeline workers for the golden path through Gate 1. 3. Evidence rules + confidence engine + unit tests (§13). 4. Frontend design system primitives, then frames 1–4. 5. Frames 6–8 wired to gates. 6. UAT stage + frame 9; learning write-back. 7. Frames 10–11, escalation + AWAITING_DOCS flows, mentor chat. 8. Durability test (§11.11), polish pass against §5, README.
+
+
+13. Definition of done
+
+
+Full demo script §11 passes manually; a pytest suite covers: every legal/illegal state transition, evidence-rule rejection cases (plan item without citation must raise), confidence bands, retry cap → escalation, learning write-back (new precedent retrievable), evidence-store hash chain integrity.
+npm run build clean, mypy clean, no console errors, empty states designed (no blank screens), all times/dates real, README explains mock vs. real adapter config (.env.example included).
+Visual check against §5: near-white background, one gradient in exactly two uses, pill buttons, monospace chips, frosted nav + chat, generous whitespace. If it looks like a dense enterprise dashboard, redo the offending screen.
+
+
+14. Do NOT
+
+
+Do not call real Jira/Bitbucket/Anthropic unless env keys are explicitly set. Do not invent additional external services. Do not use a component library or CSS framework other than Tailwind. Do not add auth (single demo user "T. Lead" / "J. Dev" switcher in nav is enough). Do not let the agent approve its own gates — gate endpoints require the human actor name. Do not add features not in this prompt.aa
