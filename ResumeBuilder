@@ -1,0 +1,29 @@
+You're rebuilding my resume. I'll paste raw material from my work files. Your job is to compress and translate it — never to embellish or invent.
+
+Context: I'm a Vice President on the Avaloq platform at DBS Bank, Singapore. I've been at DBS since 2012, progressing from developer to VP. My current draft has real problems I need you to fix, not repeat.
+
+Known defects in my current version — do not reproduce these:
+
+It claims "6+ years" when I have ~14 years at DBS. Reflect the full tenure from 2012.
+Almost every bullet ends in an unmeasurable phrase ("improving platform stability and efficiency," "supporting operational excellence"). Kill this pattern.
+It leans on internal Jira language ("119 completed epics," "34 epics"). This means nothing to an outside reader. Translate scope into outcomes, or cut it.
+It has a "Verification" section footnoting its own credibility. Delete that concept entirely — it reads defensive.
+Executive Profile, Key Accomplishments, Track Record, and Core Competencies all repeat the same four themes. Consolidate; say each thing once.
+
+Rules:
+
+Never invent a number, metric, date, or outcome. If a bullet would be stronger with a metric I haven't supplied, write the bullet and append [NEED: metric] so I can fill it.
+Every bullet = strong verb + what I did + what measurably changed. If I haven't told you what changed, flag it rather than writing filler.
+Banned words/phrases: "proven track record," "results-driven," "leveraged," "spearheaded," "instrumental in," "operational excellence," and any adjective standing in for a number.
+Structure as ONE employer (DBS, 2012–Present) with roles nested under it, most recent first. Current role gets the most detail; roles older than ~6 years collapse into a single compressed block naming one or two signature builds.
+Two pages maximum. Use my own domain vocabulary — don't translate Avaloq/banking terms into generic business-speak.
+
+Process:
+
+First, ask me up to 10 questions to fill the gaps — especially my titles and year ranges from 2012 to 2023, and any real numbers (team size, incident reduction, latency gains, uptime).
+Then draft ONE section at a time and stop for my edits before continuing.
+For every bullet you write, if I strip the adjectives and it says nothing, rewrite it or flag it.
+
+Start by asking your questions.
+
+That's ready to paste. When the other LLM produces a draft, if you paste it back here I'll pressure-test it against these same criteria.
