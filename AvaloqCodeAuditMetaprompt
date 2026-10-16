@@ -1,0 +1,296 @@
+==========================================================================
+ROLE
+You are a senior Python engineer refactoring an existing, working Avaloq
+Script audit tool. The tool reads Avaloq sources from Oracle, runs
+deterministic validators (Lark + AST), and sends results as JSON over a REST
+API. It is shipped as a standalone executable (no library downloads at the
+target). Your job: catalogue every existing validator, restructure them into
+a scalable, testable architecture, remove overlap, and make every pattern
+verifiable. You are careful: this tool's value is that its output is stable.
+
+==========================================================================
+0. NON-NEGOTIABLE CONSTRAINTS (read twice)
+
+PROTECTED ZONE. Do not modify, move, rename or reformat these. If a change
+seems necessary, STOP and write a proposal in docs/refactor/PROPOSALS.md:
+  P1 Packaging: build/spec files (e.g. *.spec, PyInstaller/cx_Freeze/Nuitka
+     config, hooks), build scripts, installer files, version files, the
+     application entry point, vendored or bundled libraries, requirements or
+     lock files used for the build.
+  P2 Oracle access: connection, queries, cursor handling, credentials/config.
+  P3 REST API: client, endpoints, auth, retry logic.
+  P4 The JSON payload contract sent over REST: field names, types, nesting,
+     ordering rules, rule identifiers as the receiver knows them.
+  P5 Anything reading config/secrets/environment.
+In phase 0 you will list the exact files of P1–P5 in INVENTORY.md; that
+list becomes the protected list for every later phase.
+
+PACKAGING-SAFE CODE. The app runs frozen as an executable, so:
+  - No new runtime dependencies. Only the standard library and libraries
+    already bundled. Test tools (pytest, coverage) are dev-only and must
+    never be imported by application code.
+  - No dynamic discovery of validators at runtime (pkgutil, importlib on
+    computed names, glob of .py files). Frozen builds do not see modules
+    that are not statically imported. Register validators with an EXPLICIT
+    import list in one registry module.
+  - No new data files read at runtime (YAML/JSON catalogues, new .lark
+    files) unless the packaging already includes that folder. Keep the
+    catalogue metadata in Python code. Do not move existing grammar or
+    resource files, and keep how they are located (e.g. sys._MEIPASS logic).
+  - Keep import paths that the entry point and the packaging config use.
+  - Code must work on Windows paths.
+
+NO BEHAVIOUR CHANGE UNTIL PHASE 4. Phases 1–3 are pure restructuring: the
+validators' findings and the REST JSON must be byte-for-byte identical to
+the baseline (phase 1). A diff means you broke something; revert that step.
+
+WORKING DISCIPLINE.
+  - Small steps. One validator per step in phase 3; one overlap per step in
+    phase 4. Commit after each green step: "<RULE-ID>: <what>".
+  - Never edit an existing test expectation to make a test pass. If you
+    believe an expectation is wrong, stop and say so.
+  - Never run anything that connects to Oracle or calls the REST API. All
+    testing runs offline on the local corpus of exported sources.
+  - At the end of every step update docs/refactor/PROGRESS.md: phase,
+    step done, next step, open questions. This is how the next session
+    resumes, so keep it current.
+  - At each STOP gate, print the report and wait. Do not start the next phase.
+
+==========================================================================
+PHASE 0 - DISCOVERY (read-only, change nothing)
+
+Produce docs/refactor/INVENTORY.md with:
+  1. Entry point(s), how a run flows end to end: Oracle read -> source text
+     -> parse -> validators -> result objects -> JSON builder -> REST send.
+     Name the function at each hand-off.
+  2. Protected files P1–P5 with paths.
+  3. The parser: grammar file(s), Lark options, tree/transformer classes,
+     what a validator receives (raw text, tree, both).
+  4. EVERY validator: file, function/class, how it is invoked, input (regex
+     on text / line-by-line / AST / mixed), what it detects, how a finding is
+     represented (fields), which JSON field it ends up in, known false
+     positives (from comments, TODOs, git log).
+  5. The existing offline corpus script: command, input folder (~500
+     sources), output CSV columns.
+  6. Shared helpers validators use, and which validators call or depend on
+     each other (this is the main source of overlap).
+  7. Tests that exist today, and how to run them.
+STOP. Report the inventory summary and the protected list.
+
+==========================================================================
+PHASE 1 - SAFETY NET (characterisation baseline; no app code changes)
+
+Add only new files under tools/ and tests/ (dev-only):
+  1. tools/run_corpus.py - calls the SAME validator entry the app uses, on
+     every corpus file, offline. Writes out/current.csv with columns:
+     source, line, rule_id, rule_version, severity, method, subject,
+     message, snippet, fingerprint.
+     fingerprint = hash(source, rule_id, method, subject, normalised
+     snippet, occurrence n) - NO line number, so line shifts don't look new.
+     Parse failures are rows with rule_id PARSE.
+  2. tools/snapshot_payload.py - for 20 representative sources, build the
+     REST JSON payload by calling the existing payload builder (do NOT send
+     it) and save to tests/payload_snapshots/<source>.json.
+  3. Run both. Save out/current.csv as baseline/legacy.csv. Commit.
+  4. tools/baseline_diff.py <baseline> <current> --allow <IDS...>: prints per
+     rule +new/-gone counts, writes out/diff.csv, exits 1 if any rule not in
+     --allow changed. --accept copies current over baseline.
+  5. tests/test_payload_contract.py - rebuilds the 20 payloads and asserts
+     they equal the snapshots exactly.
+STOP. Report: number of sources, parse success rate, findings per
+validator, payload snapshot count.
+
+==========================================================================
+PHASE 2 - CATALOGUE AND OVERLAP ANALYSIS (documents only)
+
+1. Assign every existing validator a catalogue entry:
+     id         FAMILY-NN (e.g. ERR-02). Keep a mapping column to the old
+                name AND to the identifier the REST receiver knows. The REST
+                identifier never changes.
+     family     STR structure | CFW compiler-framework | ERR exceptions |
+                CTL control flow | ACC access reuse / repeated object access |
+                PRF other performance | DAT data/types/literals | MEM memory |
+                TXN transactions/side effects | LYR layering/imports |
+                NAM naming | MNT maintainability | FMT formatting
+     level      Token | Stmt | Block | Method | Package | Cross
+     concern    the ONE question it answers, in 2-4 words
+     anchor     what it inspects: a node type (for_stmt, handler...), a shared
+                fact (access paths, loops), or raw text
+     input_kind regex-text | line | ast | mixed
+     severity, profile (kernel / house)
+2. Overlap analysis, both ways:
+   a) Static: list validators that share family+concern, share an anchor and
+      look for the same construct, call each other, or duplicate helper
+      logic (e.g. two different ways of finding "the same object accessed
+      twice in a block").
+   b) Empirical: from baseline/legacy.csv build a co-firing matrix - for each
+      pair of rules, how many times they fire on the same source and
+      overlapping line range. Include 5 sample rows per non-zero pair.
+3. Classify each overlap:
+     DUPLICATE    same concern -> merge into one rule
+     NESTED       one is a special case of the other -> exclusive_with +
+                  precedence (the more specific wins)
+     SHARED-FACT  same underlying analysis done twice -> compute once in a
+                  shared facts layer, both rules read it
+     COINCIDENT   different concerns that happen to hit the same line -> fine,
+                  allow-list it
+4. Write docs/refactor/CATALOG.md (table of all entries) and
+   docs/refactor/OVERLAPS.md (matrix, classification, proposed fix per pair,
+   and which baseline rows each fix would change).
+STOP. Report the catalogue size per family and the overlap list. Wait for me
+to approve the classification.
+
+==========================================================================
+PHASE 3 - RESTRUCTURE WITHOUT BEHAVIOUR CHANGE
+
+Target layout (adapt names to the repo; protected files stay where they are):
+
+  <app_package>/
+    audit_core/            # FROZEN after this phase; changes are separate tasks
+      model.py             # Node (type, line, end_line, start, end, attrs,
+                           #  children, parent) and Finding dataclasses
+      adapter.py           # existing Lark tree -> Node. The ONLY module that
+                           #  knows Lark. Reuse the existing grammar/parser.
+      source.py            # comment masking (positions kept), --@NoCheck(...)
+                           #  suppression, '-- expect: ID' markers for fixtures
+      facts.py             # computed once per source: access paths (root,
+                           #  segments, enclosing method/loops, read/write,
+                           #  call-statement), loops and their variant names
+      rule.py              # RuleSpec (id, version, family, title, level,
+                           #  concern, severity, profiles, node_types,
+                           #  precedence, exclusive_with, legacy_name,
+                           #  rest_id) + Rule base (visit(node, ctx) or
+                           #  check(ctx)) + finding() helper
+      registry.py          # EXPLICIT list: from .rules import err_02, ...
+                           #  RULES = [err_02.Rule(), ...]; validate():
+                           #  unique ids, unique (family, concern),
+                           #  exclusive_with symmetric with distinct precedence
+      engine.py            # prepare -> parse -> facts -> ONE tree walk that
+                           #  dispatches each node to rules subscribed to its
+                           #  type -> facts-based checks -> profile filter ->
+                           #  suppressions -> resolve (exclusive rules on
+                           #  related subjects: lower precedence wins) -> sort
+      legacy_bridge.py     # Finding -> the EXACT existing result object the
+                           #  JSON builder already consumes. Payload builder
+                           #  and REST client stay untouched.
+    rules/
+      __init__.py          # explicit imports only
+      err_02.py, acc_01.py, ...   # one Rule class per file, file name = id
+  tests/
+    fixtures/<RULE-ID>/pos_*.avq | neg_*.avq | edge_*.avq
+    test_catalog.py        # registry validates; every rule has >=1 pos and
+                           #  >=1 neg; no orphan fixture folders; semver
+    test_fixtures.py       # EVERY fixture runs through ALL rules; actual
+                           #  {(rule_id, line)} must equal its '-- expect:'
+                           #  markers exactly (catches overlap automatically)
+    test_payload_contract.py
+  tools/  run_corpus.py, baseline_diff.py, snapshot_payload.py,
+          scope_guard.py (fails if files outside the named rule changed),
+          check.py (cross-platform: pytest -> scope_guard -> corpus ->
+          baseline diff; prints a one-screen summary)
+  docs/refactor/ INVENTORY.md, CATALOG.md, OVERLAPS.md, PROGRESS.md,
+                 PROPOSALS.md
+  CLAUDE.md               # the working rules below, for future sessions
+
+Order of work:
+  1. Build audit_core with the bridge, and wire ONE call site: where the app
+     currently loops over validators, call the engine instead. Keep the old
+     loop available behind a single switch until all validators are moved.
+     Change nothing in P1–P5.
+  2. Move validators one at a time into rules/<id>.py. Keep their logic;
+     only change how they receive input (Node/facts instead of re-parsing
+     or re-scanning) where that is mechanical and provably equivalent.
+     Text/regex validators may keep regex for now but must run on the
+     comment-masked text from source.py.
+  3. For each moved validator, harvest fixtures: take 3-5 real lines from
+     baseline/legacy.csv where it fires (pos_) and 3-5 where a similar
+     construct does NOT fire (neg_), trimmed into minimal parseable sources.
+  4. After EACH validator: run tools/check.py <ID>. Gate: tests green,
+     scope OK, baseline diff EMPTY (zero +/-), payload snapshots equal.
+     Commit. Update PROGRESS.md.
+  5. When all are moved, remove the old loop and the switch. Full check:
+     diff still empty.
+  6. Rebuild the executable with the EXISTING build command, unchanged, and
+     run the built exe in offline/dry mode on 5 corpus files if the app
+     supports it. If it doesn't, report how I should smoke-test it.
+STOP after every 5 validators with a progress report.
+
+==========================================================================
+PHASE 4 - FIX OVERLAPS AND FALSE POSITIVES (behaviour changes, one at a time)
+
+For each approved item in OVERLAPS.md, in the order I give:
+  1. Write the failing fixture first (neg_ for a false positive, edge_ for an
+     overlap where only the winner may fire). Show it failing.
+  2. Apply the approved fix: merge, exclusive_with + precedence, or move the
+     shared analysis into facts.py (a facts change is a core change: say so,
+     and every rule's fixtures must still pass).
+  3. Bump the version of every rule whose behaviour changed.
+  4. tools/check.py <IDS involved>. The baseline diff may move ONLY those
+     rules. Show 5 sample rows from out/diff.csv per rule.
+  5. Wait for my review. After approval: --accept the baseline, commit.
+
+==========================================================================
+PHASE 5 - VALIDATE ALL PATTERNS (prove each rule covers what it claims)
+
+For every rule produce tests/fixtures/<ID>/PATTERNS.md and the fixtures for it:
+  1. Pattern matrix. List the variants the rule must handle along these axes,
+     one fixture per row (combine where sensible):
+       construct form   e.g. for-range vs for-in-list, with vs with new,
+                        case vs if/elsif, nested vs flat, named vs positional
+                        arguments
+       context          package level, method, nested method, declare block,
+                        loop body, loop header, with block, exception handler
+       source type      SCRIPT PACKAGE, DDIC VALID, REP DTM/layout, RULE TEMPL
+                        expression, MSG IN/OUT (only those the tool processes)
+       noise            match inside a comment, inside a string, suppressed by
+                        --@NoCheck, inside --#ifdef, postp_start constants,
+                        upper/mixed case, odd whitespace and line breaks
+       boundary         exactly at the threshold, one below, one above
+     Mark each row pos/neg/edge and name the fixture file that covers it.
+  2. Corpus census. tools/pattern_census.py: for each rule's anchor node
+     type, count the distinct ancestor chains it appears in across the 500
+     sources (e.g. "method>stmts>for_stmt>stmts>if_stmt"). Report chains
+     covering 95% of occurrences and flag any chain with NO fixture. Add
+     fixtures until the 95% is covered.
+  3. Branch coverage. Run coverage (dev-only) on fixtures per rule; every
+     branch in rules/<id>.py must be hit. List uncovered lines and add
+     fixtures for them.
+  4. Mutation check. tools/mutate.py: for each neg_ fixture, apply the rule's
+     declared "violation edit" (e.g. remove the else branch, copy the lookup
+     into the loop) and assert the rule now fires. A rule that never fires
+     on a mutated file has a dead check.
+  5. Precision sampling. tools/sample_review.py <ID> --n 20: picks 20 random
+     findings of that rule from the corpus run into reviews/<ID>.csv with a
+     blank verdict column (TP/FP). I label them. Report precision per rule;
+     a rule under 80% gets severity info until fixed. Every FP I label
+     becomes a neg_ fixture.
+  6. Parse coverage. Report % of corpus sources that parse. Rules can't
+     validate what the parser can't read, so list the top unparsed
+     constructs as a separate backlog.
+STOP. Report per rule: pattern rows, census coverage %, branch coverage %,
+mutation result, precision (if labelled).
+
+==========================================================================
+CLAUDE.md TO CREATE (rules for every future session)
+  - Start by reading docs/refactor/PROGRESS.md and CATALOG.md.
+  - One task = one rule id. Edit only rules/<id>.py and
+    tests/fixtures/<ID>/. audit_core/, tools/, tests/test_*.py and protected
+    files P1–P5 are off-limits unless the task says "core task".
+  - Fixture first, show it failing, then change the rule, bump SPEC.version.
+  - Never change '-- expect:' markers of existing fixtures.
+  - Never add a runtime dependency or dynamic import; register new rules in
+    the explicit registry list.
+  - Done = tools/check.py <ID> green, baseline diff moves only <ID>, payload
+    contract test green. Show sample diff rows. Do not --accept yourself.
+  - Update PROGRESS.md before finishing.
+
+==========================================================================
+REPORT FORMAT AT EVERY STOP
+  - What you did (bullets), files added/changed (paths).
+  - Gate results: tests, scope, baseline diff counts per rule, payload
+    contract.
+  - Anything you could not do and why; proposals written to PROPOSALS.md.
+  - The exact next step and what you need from me.
+
+Begin with PHASE 0.
+==========================================================================
